@@ -388,8 +388,21 @@ def default_state():
            "has_friend_a":False,"has_friend_b":False,"defeated_king":False,"flags":{}}
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SMALL MONSTER HUNT  – sword-based, touch = capture after sword contact
+#  SMALL MONSTER HUNT  – peta hutan besar bertile dengan pohon & padang rumput
+#  Pohon = penghalang (solid), monster bisa bersembunyi di balik pohon
 # ════════════════════════════════════════════════════════════════════════════
+
+# Tile types hutan
+FT_GRASS  = 0   # padang rumput bisa jalan
+FT_TREE   = 1   # pohon – solid, menghalangi
+FT_BUSH   = 2   # semak – bisa jalan, sedikit memperlambat (bisa sembunyi)
+FT_WATER  = 3   # sungai kecil – tidak bisa jalan
+FT_PATH   = 4   # jalan setapak
+
+FOREST_TS = 40  # tile size pixel untuk hutan
+FOREST_W  = 40  # lebar peta dalam tile
+FOREST_H  = 36  # tinggi peta dalam tile
+
 class SmallHunt:
     SWORD_R  = 55
     ULT_R    = 110
@@ -397,184 +410,542 @@ class SmallHunt:
     ULT_CD   = 120
     PHP_MAX  = 60
 
-    def __init__(self,state):
-        self.state=state
-        self.px=float(SW//2);self.py=float(SH//2)
-        self.frame=0;self.phase="hunt";self.result=None
-        self.monsters=self._spawn(30)
-        self.sword_cd=0;self.ult_cd=0
-        self.sword_anim=0;self.ult_anim=0
-        self.shake=0
-        self.ax=self.px-50;self.ay=self.py
-        self.bx=self.px+50;self.by_=self.py
-        self.particles=Particles()
-        self.php=self.PHP_MAX
-        self.inv=0
-        self.enemy_bullets=[]
+    def __init__(self, state):
+        self.state = state
+        self.frame = 0
+        self.phase = "hunt"
+        self.result = None
+        self.shake = 0
+        self.sword_cd = 0; self.ult_cd = 0
+        self.sword_anim = 0; self.ult_anim = 0
+        self.particles = Particles()
+        self.php = self.PHP_MAX
+        self.inv = 0
+        self.enemy_bullets = []
 
-    def _spawn(self,n):
-        ms=[]
-        for _ in range(n):
-            while True:
-                x=float(random.randint(40,SW-40));y=float(random.randint(40,SH-80))
-                if math.hypot(x-SW//2,y-SH//2)>80: break
+        # Bangun peta hutan
+        self.tiles = self._gen_forest()
+
+        # Spawn player di tengah peta (area aman bebas pohon)
+        spawn_wx = (FOREST_W // 2) * FOREST_TS + FOREST_TS // 2
+        spawn_wy = (FOREST_H // 2) * FOREST_TS + FOREST_TS // 2
+        self.px = float(spawn_wx)
+        self.py = float(spawn_wy)
+
+        # Teman mengikuti
+        self.ax = self.px - 50; self.ay = self.py
+        self.bx = self.px + 50; self.by_ = self.py
+
+        # Kamera
+        self.cam_x = 0.0; self.cam_y = 0.0
+
+        # Spawn monster di tile rumput
+        self.monsters = self._spawn_monsters(30)
+
+        # Pre-render variasi tile rumput (seed tetap agar sama tiap draw)
+        self._grass_seed = random.randint(0, 99999)
+
+    # ── generate peta hutan ──────────────────────────────────────────────
+    def _gen_forest(self):
+        W, H = FOREST_W, FOREST_H
+        tiles = [[FT_GRASS] * H for _ in range(W)]
+
+        # Buat jalan setapak horizontal & vertikal (cross)
+        mid_x = W // 2; mid_y = H // 2
+        for x in range(W):
+            tiles[x][mid_y] = FT_PATH
+            if x > 0: tiles[x][mid_y - 1] = FT_PATH
+        for y in range(H):
+            tiles[mid_x][y] = FT_PATH
+            if y > 0: tiles[mid_x - 1][y] = FT_PATH
+
+        # Tambah jalan diagonal
+        for i in range(min(W, H) // 2):
+            tx = i; ty = i
+            if 0 <= tx < W and 0 <= ty < H: tiles[tx][ty] = FT_PATH
+            tx2 = W - 1 - i; ty2 = i
+            if 0 <= tx2 < W and 0 <= ty2 < H: tiles[tx2][ty2] = FT_PATH
+
+        # Spawn pohon secara acak (tapi jaga area spawn player kosong)
+        rng = random.Random(42)  # seed tetap agar layout konsisten
+        clear_cx = W // 2; clear_cy = H // 2
+        for x in range(W):
+            for y in range(H):
+                # Jaga area jalan setapak & spawn area
+                if tiles[x][y] == FT_PATH: continue
+                dist_center = math.hypot(x - clear_cx, y - clear_cy)
+                if dist_center < 4: continue  # area spawn bebas pohon
+                # Tepi peta = pohon tebal
+                if x == 0 or x == W-1 or y == 0 or y == H-1:
+                    tiles[x][y] = FT_TREE; continue
+                # Pohon berkerumun
+                chance = 0.28
+                if rng.random() < chance:
+                    tiles[x][y] = FT_TREE
+
+        # Tambah semak di beberapa titik
+        for _ in range(80):
+            x = rng.randint(1, W-2); y = rng.randint(1, H-2)
+            if tiles[x][y] == FT_GRASS:
+                tiles[x][y] = FT_BUSH
+
+        # Tambah sungai kecil (jalur horizontal pendek)
+        river_y = H // 4
+        for x in range(W // 4, W * 3 // 4):
+            if tiles[x][river_y] != FT_TREE and tiles[x][river_y] != FT_PATH:
+                tiles[x][river_y] = FT_WATER
+        # Tambah sungai kedua
+        river_y2 = H * 3 // 4
+        for x in range(W // 6, W * 2 // 3):
+            if tiles[x][river_y2] != FT_TREE and tiles[x][river_y2] != FT_PATH:
+                tiles[x][river_y2] = FT_WATER
+
+        return tiles
+
+    def _tile_walkable(self, tx, ty):
+        if tx < 0 or ty < 0 or tx >= FOREST_W or ty >= FOREST_H:
+            return False
+        t = self.tiles[tx][ty]
+        return t not in (FT_TREE, FT_WATER)
+
+    def _world_walkable(self, wx, wy):
+        r = 10
+        for dx, dy in [(-r, -r), (r, -r), (-r, r), (r, r)]:
+            tx = int((wx + dx) // FOREST_TS)
+            ty = int((wy + dy) // FOREST_TS)
+            if not self._tile_walkable(tx, ty):
+                return False
+        return True
+
+    def _is_in_bush(self, wx, wy):
+        tx = int(wx // FOREST_TS); ty = int(wy // FOREST_TS)
+        if 0 <= tx < FOREST_W and 0 <= ty < FOREST_H:
+            return self.tiles[tx][ty] == FT_BUSH
+        return False
+
+    def _spawn_monsters(self, n):
+        ms = []
+        attempts = 0
+        while len(ms) < n and attempts < 5000:
+            attempts += 1
+            tx = random.randint(1, FOREST_W - 2)
+            ty = random.randint(1, FOREST_H - 2)
+            if not self._tile_walkable(tx, ty): continue
+            wx = tx * FOREST_TS + FOREST_TS // 2
+            wy = ty * FOREST_TS + FOREST_TS // 2
+            # Jangan spawn terlalu dekat player spawn
+            cx = (FOREST_W // 2) * FOREST_TS + FOREST_TS // 2
+            cy = (FOREST_H // 2) * FOREST_TS + FOREST_TS // 2
+            if math.hypot(wx - cx, wy - cy) < 150: continue
             ms.append({
-                "x":x,"y":y,
-                "vx":random.uniform(-1,1),"vy":random.uniform(-1,1),
-                "variant":random.randint(0,4),"alive":True,"stunned":0,
-                "atk_cd":random.randint(60,140),
+                "x": float(wx), "y": float(wy),
+                "vx": random.uniform(-0.8, 0.8),
+                "vy": random.uniform(-0.8, 0.8),
+                "variant": random.randint(0, 4),
+                "alive": True, "stunned": 0,
+                "atk_cd": random.randint(60, 140),
+                "hiding": False,   # sedang bersembunyi di semak
             })
         return ms
 
-    def handle_key(self,k):
-        if self.phase!="hunt": return
-        if k==pygame.K_j and self.sword_cd<=0:
-            self._slash(self.SWORD_R,dmg=1);self.sword_cd=self.SWORD_CD;self.sword_anim=12
-        if k==pygame.K_k and self.ult_cd<=0:
-            self._slash(self.ULT_R,dmg=3);self.ult_cd=self.ULT_CD;self.ult_anim=24
+    def handle_key(self, k):
+        if self.phase != "hunt": return
+        if k == pygame.K_j and self.sword_cd <= 0:
+            self._slash(self.SWORD_R); self.sword_cd = self.SWORD_CD; self.sword_anim = 12
+        if k == pygame.K_k and self.ult_cd <= 0:
+            self._slash(self.ULT_R); self.ult_cd = self.ULT_CD; self.ult_anim = 24
 
-    def _slash(self,radius,dmg):
+    def _slash(self, radius):
         for m in self.monsters:
             if not m["alive"]: continue
-            if math.hypot(m["x"]-self.px,m["y"]-self.py)<=radius:
-                m["stunned"]=40
-                self.particles.emit(m["x"],m["y"],n=8,
-                    color=[(255,200,0),(255,255,100)],spd=3,life=20,sz=4,grav=0)
+            if math.hypot(m["x"] - self.px, m["y"] - self.py) <= radius:
+                m["stunned"] = 40
+                self.particles.emit(m["x"], m["y"], n=8,
+                    color=[(255, 200, 0), (255, 255, 100)], spd=3, life=20, sz=4, grav=0)
 
-    def _monster_shoot(self,m):
-        dx=self.px-m["x"]; dy=self.py-m["y"]
-        d=max(1,math.hypot(dx,dy))
-        spd=3.2+random.uniform(-0.4,0.4)
-        spread=random.uniform(-0.18,0.18)
-        cols=[(220,80,80),(80,80,220),(80,200,80),(200,140,60),(160,80,220)]
-        col=cols[m["variant"]%len(cols)]
+    def _monster_shoot(self, m):
+        # Monster tidak tembak kalau player di semak & jarak jauh
+        player_hiding = self._is_in_bush(self.px, self.py)
+        dist = math.hypot(m["x"] - self.px, m["y"] - self.py)
+        if player_hiding and dist > 120:
+            return  # sembunyi berhasil!
+        dx = self.px - m["x"]; dy = self.py - m["y"]
+        d = max(1, math.hypot(dx, dy))
+        spd = 3.0 + random.uniform(-0.3, 0.3)
+        spread = random.uniform(-0.15, 0.15)
+        cols = [(220, 80, 80), (80, 80, 220), (80, 200, 80), (200, 140, 60), (160, 80, 220)]
+        col = cols[m["variant"] % len(cols)]
         self.enemy_bullets.append({
-            "x":float(m["x"]),"y":float(m["y"]),
-            "vx":(dx/d+spread)*spd,"vy":(dy/d+spread)*spd,
-            "r":5,"col":col,"life":70,
+            "x": float(m["x"]), "y": float(m["y"]),
+            "vx": (dx / d + spread) * spd,
+            "vy": (dy / d + spread) * spd,
+            "r": 5, "col": col, "life": 90,
         })
 
+    def _bullet_hits_tree(self, bx, by):
+        tx = int(bx // FOREST_TS); ty = int(by // FOREST_TS)
+        if 0 <= tx < FOREST_W and 0 <= ty < FOREST_H:
+            return self.tiles[tx][ty] == FT_TREE
+        return True  # di luar batas = dianggap dinding
+
     def update(self):
-        if self.phase!="hunt": return
-        self.frame+=1
-        if self.shake>0: self.shake-=1
-        if self.inv>0:   self.inv-=1
-        if self.sword_cd>0: self.sword_cd-=1
-        if self.ult_cd>0:   self.ult_cd-=1
-        if self.sword_anim>0: self.sword_anim-=1
-        if self.ult_anim>0:   self.ult_anim-=1
+        if self.phase != "hunt": return
+        self.frame += 1
+        if self.shake > 0: self.shake -= 1
+        if self.inv > 0:   self.inv -= 1
+        if self.sword_cd > 0: self.sword_cd -= 1
+        if self.ult_cd > 0:   self.ult_cd -= 1
+        if self.sword_anim > 0: self.sword_anim -= 1
+        if self.ult_anim > 0:   self.ult_anim -= 1
         self.particles.update()
 
-        keys=pygame.key.get_pressed()
-        spd=3.5
-        if keys[pygame.K_LEFT]:  self.px=max(16,self.px-spd)
-        if keys[pygame.K_RIGHT]: self.px=min(SW-16,self.px+spd)
-        if keys[pygame.K_UP]:    self.py=max(16,self.py-spd)
-        if keys[pygame.K_DOWN]:  self.py=min(SH-80,self.py+spd)
+        # Gerakan player
+        keys = pygame.key.get_pressed()
+        spd = 3.5
+        # Semak memperlambat
+        if self._is_in_bush(self.px, self.py): spd = 2.2
+        dx = 0.0; dy = 0.0
+        if keys[pygame.K_LEFT]  or keys[pygame.K_a]: dx -= spd
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]: dx += spd
+        if keys[pygame.K_UP]    or keys[pygame.K_w]: dy -= spd
+        if keys[pygame.K_DOWN]  or keys[pygame.K_s]: dy += spd
+        if dx != 0 and dy != 0: dx *= 0.707; dy *= 0.707
 
-        ha=self.state.get("has_friend_a");hb=self.state.get("has_friend_b")
+        nx = self.px + dx; ny = self.py + dy
+        if self._world_walkable(nx, self.py): self.px = nx
+        if self._world_walkable(self.px, ny): self.py = ny
+
+        # Batasi ke area peta
+        map_w_px = FOREST_W * FOREST_TS
+        map_h_px = FOREST_H * FOREST_TS
+        self.px = max(16.0, min(map_w_px - 16.0, self.px))
+        self.py = max(16.0, min(map_h_px - 16.0, self.py))
+
+        # Kamera mengikuti player
+        self.cam_x = self.px - SW // 2
+        self.cam_y = self.py - SH // 2
+
+        # Teman mengikuti
+        ha = self.state.get("has_friend_a"); hb = self.state.get("has_friend_b")
         if ha:
-            self.ax+=(self.px-55-self.ax)*0.12
-            self.ay+=(self.py-self.ay)*0.12
+            self.ax += (self.px - 55 - self.ax) * 0.10
+            self.ay += (self.py - self.ay) * 0.10
         if hb:
-            self.bx+=(self.px+55-self.bx)*0.12
-            self.by_+=(self.py-self.by_)*0.12
+            self.bx += (self.px + 55 - self.bx) * 0.10
+            self.by_ += (self.py - self.by_) * 0.10
 
+        # Update monster
+        player_hiding = self._is_in_bush(self.px, self.py)
         for m in self.monsters:
             if not m["alive"]: continue
-            if m["stunned"]>0:
-                m["stunned"]-=1
-                if math.hypot(m["x"]-self.px,m["y"]-self.py)<24:
-                    m["alive"]=False
-                    self.state["small_monsters"]=min(50,self.state["small_monsters"]+1)
-                    self.particles.emit(m["x"],m["y"],n=12,
-                        color=[(100,220,255),(200,255,200)],spd=4,life=30,sz=5,grav=-0.05)
-                    self.shake=4
-                    if self.state["small_monsters"]>=50:
-                        self.phase="full";self.result="full"
+            if m["stunned"] > 0:
+                m["stunned"] -= 1
+                if math.hypot(m["x"] - self.px, m["y"] - self.py) < 24:
+                    m["alive"] = False
+                    self.state["small_monsters"] = min(50, self.state["small_monsters"] + 1)
+                    self.particles.emit(m["x"], m["y"], n=12,
+                        color=[(100, 220, 255), (200, 255, 200)], spd=4, life=30, sz=5, grav=-0.05)
+                    self.shake = 4
+                    if self.state["small_monsters"] >= 50:
+                        self.phase = "full"; self.result = "full"
                 continue
-            m["x"]+=m["vx"];m["y"]+=m["vy"]
-            if m["x"]<20 or m["x"]>SW-20: m["vx"]*=-1
-            if m["y"]<20 or m["y"]>SH-80: m["vy"]*=-1
-            dist=math.hypot(m["x"]-self.px,m["y"]-self.py)
-            m["atk_cd"]-=1
-            if m["atk_cd"]<=0 and dist<260:
-                m["atk_cd"]=random.randint(70,130)
+
+            # Monster bersembunyi di semak jika player mendekat
+            m["hiding"] = self._is_in_bush(m["x"], m["y"])
+
+            # Gerak monster: wandering + coba ke semak terdekat sesekali
+            m["x"] += m["vx"]; m["y"] += m["vy"]
+
+            # Pantul dari pohon & batas
+            nx_m = m["x"] + m["vx"] * 4
+            ny_m = m["y"] + m["vy"] * 4
+            if not self._world_walkable(nx_m, m["y"]): m["vx"] *= -1
+            if not self._world_walkable(m["x"], ny_m): m["vy"] *= -1
+
+            # Pastikan tetap dalam batas
+            map_w_px2 = FOREST_W * FOREST_TS
+            map_h_px2 = FOREST_H * FOREST_TS
+            if m["x"] < 20: m["x"] = 20.0; m["vx"] = abs(m["vx"])
+            if m["x"] > map_w_px2 - 20: m["x"] = map_w_px2 - 20.0; m["vx"] = -abs(m["vx"])
+            if m["y"] < 20: m["y"] = 20.0; m["vy"] = abs(m["vy"])
+            if m["y"] > map_h_px2 - 20: m["y"] = map_h_px2 - 20.0; m["vy"] = -abs(m["vy"])
+
+            # Tembak ke player
+            dist = math.hypot(m["x"] - self.px, m["y"] - self.py)
+            m["atk_cd"] -= 1
+            if m["atk_cd"] <= 0 and dist < 280:
+                m["atk_cd"] = random.randint(70, 130)
                 self._monster_shoot(m)
 
+        # Update peluru – peluru dihentikan pohon
         for b in self.enemy_bullets[:]:
-            b["x"]+=b["vx"]; b["y"]+=b["vy"]; b["life"]-=1
-            if b["life"]<=0 or b["x"]<0 or b["x"]>SW or b["y"]<0 or b["y"]>SH:
+            b["x"] += b["vx"]; b["y"] += b["vy"]; b["life"] -= 1
+            if b["life"] <= 0:
                 self.enemy_bullets.remove(b); continue
-            if self.inv<=0 and math.hypot(b["x"]-self.px,b["y"]-self.py)<b["r"]+8:
-                self.php-=6; self.inv=30; self.shake=5
-                self.particles.emit(self.px,self.py,n=6,
-                    color=[(255,80,80),(255,160,0)],spd=2,life=14,sz=3,grav=0)
+            # Cek keluar peta
+            if b["x"] < 0 or b["x"] > FOREST_W * FOREST_TS or \
+               b["y"] < 0 or b["y"] > FOREST_H * FOREST_TS:
+                self.enemy_bullets.remove(b); continue
+            # Peluru menghantam pohon
+            if self._bullet_hits_tree(b["x"], b["y"]):
+                self.particles.emit(b["x"], b["y"], n=3,
+                    color=[(140, 80, 40), (100, 60, 20)], spd=1, life=10, sz=2, grav=0.1)
+                self.enemy_bullets.remove(b); continue
+            # Kena player (kecuali di semak & jarak jauh)
+            if self.inv <= 0 and math.hypot(b["x"] - self.px, b["y"] - self.py) < b["r"] + 8:
+                # Semak mengurangi damage
+                dmg = 3 if self._is_in_bush(self.px, self.py) else 6
+                self.php -= dmg; self.inv = 30; self.shake = 5
+                self.particles.emit(self.px, self.py, n=6,
+                    color=[(255, 80, 80), (255, 160, 0)], spd=2, life=14, sz=3, grav=0)
                 self.enemy_bullets.remove(b)
-                if self.php<=0:
-                    self.php=0; self.phase="lost"; self.result="lost"
+                if self.php <= 0:
+                    self.php = 0; self.phase = "lost"; self.result = "lost"
                 continue
 
-        alive=[m for m in self.monsters if m["alive"]]
-        if not alive and self.phase=="hunt":
-            self.phase="done";self.result="cleared"
+        alive = [m for m in self.monsters if m["alive"]]
+        if not alive and self.phase == "hunt":
+            self.phase = "done"; self.result = "cleared"
 
-    def draw(self,s):
-        ox=random.randint(-3,3) if self.shake else 0
-        s.fill(C["dkgreen"])
-        for gx in range(0,SW,32): pygame.draw.line(s,(40,110,40),(gx,0),(gx,SH))
-        for gy in range(0,SH,32): pygame.draw.line(s,(40,110,40),(0,gy),(SW,gy))
+    # ── gambar tile hutan ────────────────────────────────────────────────
+    def _draw_tile(self, s, tile_type, sx, sy, tx, ty):
+        if tile_type == FT_GRASS:
+            # Variasi warna rumput
+            shade = ((tx * 7 + ty * 13) % 5) * 4
+            col = (32 + shade, 100 + shade, 32 + shade)
+            pxr(s, col, (sx, sy, FOREST_TS, FOREST_TS))
+            # Detail rumput kecil
+            if (tx * 3 + ty * 5) % 7 == 0:
+                pygame.draw.line(s, (50, 130, 50),
+                    (sx + 8, sy + FOREST_TS - 6),
+                    (sx + 6, sy + FOREST_TS - 14), 1)
+                pygame.draw.line(s, (50, 130, 50),
+                    (sx + 16, sy + FOREST_TS - 6),
+                    (sx + 18, sy + FOREST_TS - 14), 1)
 
-        if self.sword_anim>0:
-            pygame.draw.circle(s,(255,220,0),(int(self.px+ox),int(self.py)),self.SWORD_R,2)
-        if self.ult_anim>0:
-            surf2=pygame.Surface((SW,SH),pygame.SRCALPHA)
-            pygame.draw.circle(surf2,(255,200,0,60),(int(self.px+ox),int(self.py)),self.ULT_R)
-            s.blit(surf2,(0,0))
-            pygame.draw.circle(s,(255,220,80),(int(self.px+ox),int(self.py)),self.ULT_R,3)
+        elif tile_type == FT_PATH:
+            # Jalan setapak tanah
+            shade = ((tx * 5 + ty * 9) % 4) * 5
+            col = (110 + shade, 80 + shade, 40 + shade)
+            pxr(s, col, (sx, sy, FOREST_TS, FOREST_TS))
+            # Tekstur jalan
+            if (tx + ty) % 3 == 0:
+                pxr(s, (100, 72, 35), (sx + 6, sy + 10, 10, 4))
+            if (tx * 2 + ty) % 4 == 0:
+                pxr(s, (100, 72, 35), (sx + 18, sy + 24, 8, 3))
 
+        elif tile_type == FT_BUSH:
+            # Dasar rumput
+            pxr(s, (32, 100, 32), (sx, sy, FOREST_TS, FOREST_TS))
+            # Semak hijau gelap
+            pygame.draw.ellipse(s, (20, 90, 20), (sx + 2, sy + 8, FOREST_TS - 4, FOREST_TS - 12))
+            pygame.draw.ellipse(s, (35, 110, 35), (sx + 4, sy + 10, FOREST_TS - 10, FOREST_TS - 18))
+            # Bunga kecil semak
+            if (tx * 3 + ty * 7) % 5 == 0:
+                pygame.draw.circle(s, (200, 200, 60), (sx + FOREST_TS // 2, sy + 14), 3)
+
+        elif tile_type == FT_WATER:
+            # Sungai / kolam
+            t_anim = (self.frame + tx * 4 + ty * 3) % 60
+            blue_shade = int(abs(math.sin(t_anim * 0.1)) * 20)
+            col = (30, 80 + blue_shade, 160 + blue_shade)
+            pxr(s, col, (sx, sy, FOREST_TS, FOREST_TS))
+            # Riak air
+            if (self.frame // 20 + tx + ty) % 2 == 0:
+                pygame.draw.ellipse(s, (60, 120, 200),
+                    (sx + 4, sy + FOREST_TS // 2 - 3, FOREST_TS - 8, 6), 1)
+
+        elif tile_type == FT_TREE:
+            # Akar / tanah gelap di bawah pohon
+            pxr(s, (25, 60, 20), (sx, sy, FOREST_TS, FOREST_TS))
+            # Batang pohon
+            trunk_x = sx + FOREST_TS // 2 - 4
+            trunk_y = sy + FOREST_TS // 2
+            pxr(s, (90, 55, 20), (trunk_x, trunk_y, 8, FOREST_TS // 2))
+            # Kanopi pohon (lapisan bawah)
+            pygame.draw.circle(s, (25, 80, 20),
+                (sx + FOREST_TS // 2, sy + FOREST_TS // 2 - 2),
+                FOREST_TS // 2 - 1)
+            # Kanopi pohon (lapisan atas – lebih terang)
+            pygame.draw.circle(s, (40, 110, 30),
+                (sx + FOREST_TS // 2, sy + FOREST_TS // 2 - 6),
+                FOREST_TS // 2 - 5)
+            # Highlight pohon
+            pygame.draw.circle(s, (55, 140, 40),
+                (sx + FOREST_TS // 2 - 4, sy + FOREST_TS // 2 - 10),
+                FOREST_TS // 4)
+            # Garis gelap pinggiran untuk depth
+            pygame.draw.circle(s, (15, 55, 15),
+                (sx + FOREST_TS // 2, sy + FOREST_TS // 2 - 2),
+                FOREST_TS // 2 - 1, 2)
+
+    def draw(self, s):
+        ox = random.randint(-3, 3) if self.shake else 0
+        oy = random.randint(-3, 3) if self.shake else 0
+
+        cam_x = int(self.cam_x); cam_y = int(self.cam_y)
+
+        # Hitung tile yang terlihat
+        start_tx = max(0, cam_x // FOREST_TS - 1)
+        start_ty = max(0, cam_y // FOREST_TS - 1)
+        end_tx   = min(FOREST_W, start_tx + SW // FOREST_TS + 3)
+        end_ty   = min(FOREST_H, start_ty + SH // FOREST_TS + 3)
+
+        # Gambar tile latar
+        for tx in range(start_tx, end_tx):
+            for ty in range(start_ty, end_ty):
+                sx = tx * FOREST_TS - cam_x + ox
+                sy = ty * FOREST_TS - cam_y + oy
+                self._draw_tile(s, self.tiles[tx][ty], sx, sy, tx, ty)
+
+        # Lingkaran pedang
+        psx = int(self.px - cam_x + ox); psy = int(self.py - cam_y + oy)
+        if self.sword_anim > 0:
+            pygame.draw.circle(s, (255, 220, 0), (psx, psy), self.SWORD_R, 2)
+        if self.ult_anim > 0:
+            surf2 = pygame.Surface((SW, SH), pygame.SRCALPHA)
+            pygame.draw.circle(surf2, (255, 200, 0, 55), (psx, psy), self.ULT_R)
+            s.blit(surf2, (0, 0))
+            pygame.draw.circle(s, (255, 220, 80), (psx, psy), self.ULT_R, 3)
+
+        # Gambar peluru musuh
         for b in self.enemy_bullets:
-            pygame.draw.circle(s,b["col"],(int(b["x"]+ox),int(b["y"])),b["r"])
-            pygame.draw.circle(s,C["white"],(int(b["x"]+ox),int(b["y"])),b["r"],1)
+            bsx = int(b["x"] - cam_x + ox); bsy = int(b["y"] - cam_y + oy)
+            if -20 < bsx < SW + 20 and -20 < bsy < SH + 20:
+                pygame.draw.circle(s, b["col"], (bsx, bsy), b["r"])
+                pygame.draw.circle(s, C["white"], (bsx, bsy), b["r"], 1)
 
+        # Gambar monster (monster di semak tampak lebih transparan)
+        for m in self.monsters:
+            if not m["alive"]: continue
+            mx = int(m["x"] - cam_x + ox); my = int(m["y"] - cam_y + oy)
+            if -30 < mx < SW + 30 and -30 < my < SH + 30:
+                if m["hiding"]:
+                    # Efek transparan saat di semak
+                    tmp = pygame.Surface((28, 28), pygame.SRCALPHA)
+                    draw_small_monster(tmp, 14, 20, m["variant"])
+                    tmp.set_alpha(130)
+                    s.blit(tmp, (mx - 14, my - 20))
+                else:
+                    draw_small_monster(s, mx, my, m["variant"])
+                if m["stunned"] > 0:
+                    pygame.draw.circle(s, C["yellow"], (mx, my - 18), 6, 2)
+
+        self.particles.draw(s, -cam_x + ox, -cam_y + oy)
+
+        # Teman
+        ha = self.state.get("has_friend_a"); hb = self.state.get("has_friend_b")
+        if ha:
+            ax_s = int(self.ax - cam_x + ox); ay_s = int(self.ay - cam_y + oy)
+            if -30 < ax_s < SW + 30: draw_friend_a(s, ax_s, ay_s, self.frame)
+        if hb:
+            bx_s = int(self.bx - cam_x + ox); by_s = int(self.by_ - cam_y + oy)
+            if -30 < bx_s < SW + 30: draw_friend_b(s, bx_s, by_s, self.frame)
+
+        # Player (berkedip saat invincible)
+        if self.inv <= 0 or (self.frame // 4) % 2 == 0:
+            draw_player(s, psx, psy, frame=self.frame,
+                        sword=self.sword_anim > 0, ult=self.ult_anim > 0)
+
+        # Indikator sembunyi di semak
+        if self._is_in_bush(self.px, self.py):
+            pxt(s, "BERSEMBUNYI", F_SM, (140, 255, 140), psx, psy - 52, center=True)
+
+        # HUD – panel gelap semi-transparan agar terlihat di atas hutan hijau
+        sm = self.state["small_monsters"]
+        alive_cnt = sum(1 for m in self.monsters if m["alive"])
+
+        # Panel HUD kiri
+        hud_left = pygame.Surface((320, 116), pygame.SRCALPHA)
+        hud_left.fill((0, 0, 0, 180))
+        s.blit(hud_left, (4, 4))
+        pygame.draw.rect(s, (100, 100, 100), (4, 4, 320, 116), 2)
+
+        # ── HP bar merah ──
+        # Label
+        pxt(s, "HP", F_SM, C["white"], 10, 10)
+        pxt(s, f"{self.php}/{self.PHP_MAX}", F_SM, C["white"], 220, 10)
+        # Background bar (merah gelap = HP hilang)
+        bar_x, bar_y, bar_w, bar_h = 10, 26, 300, 16
+        pxr(s, (80, 10, 10), (bar_x, bar_y, bar_w, bar_h))
+        # Fill merah = HP sisa
+        fill_w = int(bar_w * max(0, self.php) / max(1, self.PHP_MAX))
+        if fill_w > 0:
+            # Gradient merah terang di kiri, gelap di kanan
+            pxr(s, (220, 40, 40), (bar_x, bar_y, fill_w, bar_h))
+            pxr(s, (255, 80, 80), (bar_x, bar_y, fill_w, bar_h // 2))
+        pygame.draw.rect(s, (160, 160, 160), (bar_x, bar_y, bar_w, bar_h), 2)
+
+        # ── Capture bar kuning ──
+        pxt(s, "Monster", F_SM, C["white"], 10, 48)
+        pxt(s, f"{sm}/50", F_SM, C["white"], 220, 48)
+        bar2_x, bar2_y, bar2_w, bar2_h = 10, 64, 300, 16
+        pxr(s, (60, 50, 10), (bar2_x, bar2_y, bar2_w, bar2_h))
+        fill2_w = int(bar2_w * max(0, sm) / 50)
+        if fill2_w > 0:
+            pxr(s, (210, 180, 20), (bar2_x, bar2_y, fill2_w, bar2_h))
+            pxr(s, (255, 230, 60), (bar2_x, bar2_y, fill2_w, bar2_h // 2))
+        pygame.draw.rect(s, (160, 160, 160), (bar2_x, bar2_y, bar2_w, bar2_h), 2)
+
+        pxt(s, f"[J]=Tebas(CD:{self.sword_cd}) [K]=Ult(CD:{self.ult_cd})", F_SM, C["yellow"], 10, 86)
+        pxt(s, "Semak=sembunyi! Pohon=halang peluru!", F_SM, C["cyan"], 10, 102)
+
+        # Panel HUD kanan atas
+        hud_right = pygame.Surface((152, 40), pygame.SRCALPHA)
+        hud_right.fill((0, 0, 0, 180))
+        s.blit(hud_right, (SW - 158, 4))
+        pygame.draw.rect(s, (100, 100, 100), (SW - 158, 4, 152, 40), 2)
+        pxt(s, "[X]=Kembali", F_SM, C["orange"], SW - 154, 8)
+        pxt(s, f"Sisa: {alive_cnt}", F_SM, C["white"], SW - 154, 24)
+
+        # Minimap hutan (kanan bawah)
+        self._draw_minimap(s)
+
+        if self.phase in ("done", "full", "lost"):
+            pxr(s, C["black"], (SW // 2 - 210, SH // 2 - 30, 420, 90))
+            if self.result == "full":
+                pxt(s, "MONSTER SUDAH CUKUP! (50/50)", F_LG, C["yellow"], SW // 2, SH // 2, center=True)
+                pxt(s, "Kembali ke Map Dunia...", F_MD, C["white"], SW // 2, SH // 2 + 44, center=True)
+            elif self.result == "lost":
+                pxt(s, "KAU PINGSAN! Kembali ke Map...", F_LG, C["red"], SW // 2, SH // 2, center=True)
+                pxt(s, "ENTER lanjut", F_MD, C["white"], SW // 2, SH // 2 + 44, center=True)
+            else:
+                pxt(s, f"Area Bersih! +{sm} monster", F_LG, C["cyan"], SW // 2, SH // 2, center=True)
+                pxt(s, "ENTER lanjut", F_MD, C["white"], SW // 2, SH // 2 + 44, center=True)
+
+    def _draw_minimap(self, s):
+        mm_scale = 3
+        mm_w = FOREST_W * mm_scale; mm_h = FOREST_H * mm_scale
+        mm_x = SW - mm_w - 8; mm_y = SH - mm_h - 8
+        mm = pygame.Surface((mm_w, mm_h))
+        mm.fill((20, 60, 20))
+        # Warna minimap per tile
+        tile_mm_col = {
+            FT_GRASS: (40, 110, 40),
+            FT_PATH:  (120, 90, 50),
+            FT_BUSH:  (20, 80, 20),
+            FT_WATER: (40, 80, 160),
+            FT_TREE:  (15, 50, 15),
+        }
+        for tx in range(FOREST_W):
+            for ty in range(FOREST_H):
+                col = tile_mm_col.get(self.tiles[tx][ty], (40, 110, 40))
+                pxr(mm, col, (tx * mm_scale, ty * mm_scale, mm_scale, mm_scale))
+        # Monster di minimap
         for m in self.monsters:
             if m["alive"]:
-                draw_small_monster(s,m["x"]+ox,m["y"],m["variant"])
-                if m["stunned"]>0:
-                    pygame.draw.circle(s,C["yellow"],(int(m["x"]+ox),int(m["y"]-18)),6,2)
-
-        self.particles.draw(s)
-
-        ha=self.state.get("has_friend_a");hb=self.state.get("has_friend_b")
-        if ha: draw_friend_a(s,self.ax+ox,self.ay,self.frame)
-        if hb: draw_friend_b(s,self.bx+ox,self.by_,self.frame)
-
-        if self.inv<=0 or (self.frame//4)%2==0:
-            draw_player(s,self.px+ox,self.py,frame=self.frame,
-                        sword=self.sword_anim>0,ult=self.ult_anim>0)
-
-        sm=self.state["small_monsters"]
-        hpbar(s,10,10,140,14,self.php,self.PHP_MAX,(80,200,80))
-        pxt(s,f"HP: {self.php}/{self.PHP_MAX}",F_SM,C["white"],10,28)
-        hpbar(s,10,46,180,12,sm,50,(80,180,220))
-        pxt(s,f"Tangkap: {sm}/50",F_SM,C["white"],10,62)
-        pxt(s,f"[J]=Tebas(CD:{self.sword_cd}) [K]=Ult(CD:{self.ult_cd})",F_SM,C["yellow"],10,78)
-        pxt(s,"Dodge peluru! Tebas lalu sentuh monster kuning!",F_SM,C["cyan"],10,94)
-        pxt(s,"[X]=Kembali",F_SM,C["orange"],SW-150,10)
-        alive_cnt=sum(1 for m in self.monsters if m["alive"])
-        pxt(s,f"Sisa: {alive_cnt}",F_SM,C["white"],SW-150,30)
-
-        if self.phase in("done","full","lost"):
-            pxr(s,C["black"],(SW//2-210,SH//2-30,420,90))
-            if self.result=="full":
-                pxt(s,"MONSTER SUDAH CUKUP! (50/50)",F_LG,C["yellow"],SW//2,SH//2,center=True)
-                pxt(s,"Kembali ke Map Dunia...",F_MD,C["white"],SW//2,SH//2+44,center=True)
-            elif self.result=="lost":
-                pxt(s,"KAU PINGSAN! Kembali ke Map...",F_LG,C["red"],SW//2,SH//2,center=True)
-                pxt(s,"ENTER lanjut",F_MD,C["white"],SW//2,SH//2+44,center=True)
-            else:
-                pxt(s,f"Area Bersih! +{sm} monster",F_LG,C["cyan"],SW//2,SH//2,center=True)
-                pxt(s,"ENTER lanjut",F_MD,C["white"],SW//2,SH//2+44,center=True)
+                mmx = int(m["x"] // FOREST_TS) * mm_scale
+                mmy = int(m["y"] // FOREST_TS) * mm_scale
+                pygame.draw.rect(mm, (200, 50, 50), (mmx, mmy, mm_scale, mm_scale))
+        # Player di minimap
+        pmx = int(self.px // FOREST_TS) * mm_scale
+        pmy = int(self.py // FOREST_TS) * mm_scale
+        pygame.draw.rect(mm, (100, 200, 255), (pmx, pmy, mm_scale + 1, mm_scale + 1))
+        # Border
+        pxr(s, (20, 50, 20), (mm_x - 2, mm_y - 2, mm_w + 4, mm_h + 4))
+        s.blit(mm, (mm_x, mm_y))
+        pygame.draw.rect(s, (60, 130, 60), (mm_x - 2, mm_y - 2, mm_w + 4, mm_h + 4), 2)
+        pxt(s, "PETA", F_SM, (140, 220, 140), mm_x + mm_w // 2, mm_y - 16, center=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
